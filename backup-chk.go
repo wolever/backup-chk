@@ -268,13 +268,21 @@ func check(refItem *WalkerItem, bckItem WalkerItem) error {
 }
 
 func main() {
-	refRoot, err := WalkerItemFromRoot("a")
+	args := make([]string, 2)
+	if len(os.Args) == 1 {
+		args[0] = "a"
+		args[1] = "b"
+	} else {
+		args = os.Args[1:]
+	}
+
+	refRoot, err := WalkerItemFromRoot(args[0])
 	if err != nil {
 		log.Fatal(err)
 		return
 	}
 
-	bckRoot, err := WalkerItemFromRoot("b")
+	bckRoot, err := WalkerItemFromRoot(args[1])
 	if err != nil {
 		log.Fatal(err)
 		return
