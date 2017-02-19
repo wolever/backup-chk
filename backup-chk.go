@@ -1,16 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
+	"os/exec"
 	"path"
-	"reflect"
+	"strings"
+
+	"github.com/alexcesaro/log"
+	"github.com/alexcesaro/log/golog"
+	flags "github.com/jessevdk/go-flags"
 )
 
 var ERR_NOT_DIR = errors.New("not a directory")
+
+var logger *golog.Logger
 
 type WalkerItem struct {
 	root     *string
@@ -251,7 +258,7 @@ func check(refItem *WalkerItem, bckItem WalkerItem) error {
 			return err
 		}
 
-		if !reflect.DeepEqual(rChunk, bChunk) {
+		if bytes.Compare(rChunk, bChunk) != 0 {
 			return checkError(
 				fmt.Sprintf("(chunk of size %d)", rSz),
 				fmt.Sprintf("(chunk of size %d)", bSz),
@@ -267,50 +274,161 @@ func check(refItem *WalkerItem, bckItem WalkerItem) error {
 	return nil
 }
 
+type CmdlineOptions struct {
+	Verbose []bool `short:"v" long:"verbose" description:"Show verbose debug information"`
+}
+
+type TMGuess struct {
+	NoTM      bool
+	Unmounted bool
+	Invalid   bool
+	Directory *string
+}
+
+func guessTimeMachineBackup() *TMGuess {
+	outBytes, err := exec.Command("tmutil", "latestbackup").CombinedOutput()
+
+	out := strings.Trim(string(outBytes), " \n")
+	if !strings.HasPrefix(out, "/") {
+		logger.Debugf("tmutil unexpected output: %s (not guessing default directories)", out)
+		return &TMGuess{
+			Unmounted: true,
+		}
+	}
+
+	if err != nil {
+		logger.Debugf("tmutil returned error: %s (not guessing default directories)", err)
+		return &TMGuess{
+			NoTM: true,
+		}
+	}
+
+	st, err := os.Stat(out)
+	if err != nil || !st.IsDir() {
+		logger.Debugf("tmutil did not return a directory: %s (not guessing default directories)", out)
+		return &TMGuess{
+			Invalid: true,
+		}
+	}
+	return &TMGuess{
+		Directory: &out,
+	}
+}
+
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func main() {
-	args := make([]string, 2)
-	if len(os.Args) == 1 {
-		args[0] = "a"
-		args[1] = "b"
-	} else {
-		args = os.Args[1:]
+	opts := CmdlineOptions{}
+	parser := flags.NewParser(&opts, flags.Default)
+	parser.Usage = "[-v] REFERENCE_DIR:BACKUP_DIR ..."
+	args, err := parser.Parse()
+
+	var logLevels = []log.Level{
+		log.Warning,
+		log.Info,
+		log.Debug,
+	}
+	logLevel := logLevels[min(len(opts.Verbose), len(logLevels)-1)]
+	logger = golog.New(os.Stderr, logLevel)
+
+	guess := (*TMGuess)(nil)
+	if args != nil && len(args) == 0 {
+		guess = guessTimeMachineBackup()
+		if (*guess).Directory != nil {
+			args = []string{"/Home/" + path.Join(*guess.Directory, "Home")}
+		}
 	}
 
-	refRoot, err := WalkerItemFromRoot(args[0])
 	if err != nil {
-		log.Fatal(err)
+		if args == nil {
+			fmt.Print(err)
+		}
+		fmt.Println("Example:")
+		argv0 := os.Args[0]
+		if len(argv0) > 15 {
+			argv0 = "..." + argv0[len(argv0)-15:]
+		}
+		fmt.Printf("  $ %s /Users/wolever:/Volumes/Backup/Users/wolever\n", argv0)
+		fmt.Printf("\n")
+		fmt.Printf("Defaults:\n")
+		fmt.Printf("  On OS X, REFERENCE_DIR defaults to /Home/ and BACKUP_DIR \n")
+		fmt.Printf("  defaults to your most recent Time Machine backup.\n")
+		if guess != nil {
+			g := *guess
+			if g.NoTM {
+				fmt.Println("  Time Machine (tmutil) was not found so there will be no default.")
+			} else if g.Unmounted {
+				fmt.Println("  Your Time Machine backup isn't mounted and will not be used.")
+			} else if g.Invalid {
+				fmt.Println("  tmutil returned an invalid path (use -vvv for more).")
+			} else if g.Directory != nil {
+				fmt.Println("  This Time Machine backup will be used: " + *g.Directory)
+			}
+		}
+		fmt.Printf("\n")
+		os.Exit(1)
 		return
 	}
 
-	bckRoot, err := WalkerItemFromRoot(args[1])
-	if err != nil {
-		log.Fatal(err)
-		return
+	type Pair struct {
+		ref *WalkerItem
+		bck *WalkerItem
 	}
 
-	walker := NewDFWalker(refRoot)
+	pairs := make([]Pair, len(args))
+	for idx, backup := range args {
+		pair := strings.Split(backup, ":")
+		if len(pair) != 2 {
+			logger.Errorf("invalid REFERENCE_DIR:BACKUP_DIR pair: %s (hint: /Home/:/Volumes/Backup/Home)", backup)
+			os.Exit(1)
+		}
 
-	for {
-		refItem, err := walker.Next()
+		refRoot, err := WalkerItemFromRoot(pair[0])
 		if err != nil {
-			fmt.Println("ERROR:", err)
-			log.Fatal(err)
-			return
+			logger.Error(err)
+			os.Exit(1)
 		}
 
-		if refItem == nil {
-			break
-		}
-
-		if refItem.Err() != nil {
-			fmt.Println("ASSERITON ERROR: refItem.Err() should not be nil")
-			log.Fatal(refItem.Err())
-			return
-		}
-
-		err = check(refItem, bckRoot.GetItem(refItem))
+		bckRoot, err := WalkerItemFromRoot(pair[1])
 		if err != nil {
-			fmt.Printf("%s: %s\n", refItem.RelPath(), err)
+			logger.Error(err)
+			os.Exit(1)
+		}
+
+		pairs[idx] = Pair{refRoot, bckRoot}
+	}
+
+	for _, pair := range pairs {
+
+		walker := NewDFWalker(pair.ref)
+
+		for {
+			refItem, err := walker.Next()
+			if err != nil {
+				fmt.Println("ERROR:", err)
+				logger.Error(err)
+				return
+			}
+
+			if refItem == nil {
+				break
+			}
+
+			if refItem.Err() != nil {
+				fmt.Println("ASSERITON ERROR: refItem.Err() should not be nil")
+				logger.Error(refItem.Err())
+				return
+			}
+
+			err = check(refItem, pair.bck.GetItem(refItem))
+			if err != nil {
+				fmt.Printf("%s: %s\n", refItem.RelPath(), err)
+			}
 		}
 	}
 }
