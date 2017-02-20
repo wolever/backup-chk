@@ -112,7 +112,21 @@ func (i *WalkerItem) Readlink() (string, error) {
 }
 
 func (i *WalkerItem) Open() (*os.File, error) {
-	return os.Open(i.path)
+	if i.file == nil {
+		file, err := os.Open(i.path)
+		if err != nil {
+			return nil, err
+		}
+		i.file = file
+	}
+	return i.file, nil
+}
+
+func (i *WalkerItem) Close() {
+	if i.file != nil {
+		i.file.Close()
+		i.file = nil
+	}
 }
 
 func (i *WalkerItem) Readdir(n int) ([]*WalkerItem, error) {
@@ -120,11 +134,7 @@ func (i *WalkerItem) Readdir(n int) ([]*WalkerItem, error) {
 		return nil, ERR_NOT_DIR
 	}
 	if i.file == nil {
-		file, err := os.Open(i.path)
-		if err != nil {
-			return nil, err
-		}
-		i.file = file
+		return nil, errors.New("Must Open before Readdir")
 	}
 	files, err := i.file.Readdir(n)
 	if err != nil {
@@ -193,6 +203,7 @@ func NewDFWalker(configDir string, root *WalkerItem, exclude pathMatchFn) (*DFWa
 		logfile: logfile,
 		root:    root,
 		stack:   stack,
+		exclude: exclude,
 	}, nil
 }
 
@@ -256,6 +267,12 @@ func (w *DFWalker) Next() (*WalkerItem, error) {
 	}
 
 	if item.IsDir() && !item.SkipReaddir {
+		_, err := item.Open()
+		if err != nil {
+			return nil, err
+		}
+		defer item.Close()
+
 		for {
 			contents, err := item.Readdir(1000)
 			if err != nil && err != io.EOF {
@@ -344,13 +361,13 @@ func check(refItem *WalkerItem, bckItem *WalkerItem) error {
 	if err != nil {
 		return err
 	}
-	defer rf.Close()
+	defer refItem.Close()
 
 	bf, err := bckItem.Open()
 	if err != nil {
 		return err
 	}
-	defer bf.Close()
+	defer bckItem.Close()
 
 	chunkSize := 4096
 	rChunk := make([]byte, chunkSize)
@@ -575,8 +592,28 @@ func _main() int {
 		}
 		opts.Exclude = append(
 			opts.Exclude,
-			"Library/Cache",
 			".Trash",
+
+			"Library/Logs",
+			"Library/Cache",
+			"Library/Saved Application State",
+			"Library/Application Support/*/Cache",
+			"Library/Calendars/Calendar Cache",
+
+			// iTunes
+			"Album Artwork/Cache",
+			"Album Artwork/Store",
+			"Album Artwork/Generated",
+
+			// iPhoto
+			"CloudSync.noindex", // In private/com.apple.cloudphotosd
+			".photoslibrary/database",
+			"Library/Containers/com.apple.cloudphotosd/*cloudphotoservicelibrary/database",
+
+			// XCode
+			"Xcode/UserData/IB Support/Simulator Devices",
+			"Xcode/DerivedData",
+			"CoreSimulator/Devices",
 		)
 	}
 
@@ -750,17 +787,27 @@ func _main() int {
 			}
 			count += 1
 
-			if logLevel >= log.Info && !bckItem.IsDir() {
+			if logLevel >= log.Warning && !bckItem.IsDir() {
 				now := time.Now()
 				if now.Sub(lastTime).Seconds() > 3 {
 					lastTime = now
 					rate := float64(TOTAL_BYTES_READ) / now.Sub(startTime).Seconds() / 1024.0 / 1024.0
-					c.Printf(
-						"\r\033[2K%s checked / %s errors @ %0.02fGB/s (%s)",
-						FormatInt(errCount),
+					msg := fmt.Sprintf("%s checked / %s errors @ %0.02fGB/s",
 						FormatInt(count),
+						FormatInt(errCount),
 						rate,
-						bckItem.RelPath())
+					)
+
+					_, cols, _ := GetWinSize()
+					path := bckItem.RelPath()
+					if cols > 0 {
+						width := cols - len(msg) - 3
+						if len(path) > width {
+							path = "..." + path[len(path)-width+3:]
+						}
+					}
+
+					c.Printf("\r\033[2K%s (%s)", msg, path)
 				}
 			}
 		}

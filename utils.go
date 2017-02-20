@@ -1,9 +1,13 @@
 package main
 
 import (
+	"os"
 	"os/user"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
+	"unsafe"
 )
 
 func ExpandUser(path string) (string, error) {
@@ -53,4 +57,27 @@ func FormatInt(n interface{}) string {
 			out[j] = ','
 		}
 	}
+}
+
+func GetWinSize() (int, int, error) {
+	var ttyFd uintptr
+	tty, err := os.Open("/dev/tty")
+	if err != nil {
+		return -1, -1, err
+	}
+	defer tty.Close()
+
+	ttyFd = tty.Fd()
+
+	w := [4]uint16{0, 0, 0, 0}
+	_, _, retval := syscall.Syscall(syscall.SYS_IOCTL,
+		ttyFd,
+		syscall.TIOCGWINSZ,
+		uintptr(unsafe.Pointer(&w)),
+	)
+	runtime.GC()
+	if retval != 0 {
+		return -1, -1, err
+	}
+	return int(w[0]), int(w[1]), nil
 }

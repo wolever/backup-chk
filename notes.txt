@@ -3,3 +3,10 @@
 - save number of files read inside directory to cache
 - Add --timemachine option which:
     - Uses the timestamp on the backup to ignore files created after that time
+    - Get TimeMachine exclusions from:
+        - /System/Library/CoreServices/backupd.bundle/Contents/Resources/StdExclusions.plist
+        - mdfind "com_apple_backup_excludeItem = 'com.apple.backupd'"
+     
+- Don't recurse into a directory if it doesn't exist on the backup
+- Allow patterns to have a '/' suffix to only match directories
+- Don't crash if reference files can't be read
