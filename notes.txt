@@ -1,6 +1,6 @@
+- make saving/restoring state actually work
+    - save number of files read inside directory to cache
 - Make sure we don't cross filesystem boundries
-- save currently processing file to cache
-- save number of files read inside directory to cache
 - Add --timemachine option which:
     - Uses the timestamp on the backup to ignore files created after that time
     - Get TimeMachine exclusions from:
