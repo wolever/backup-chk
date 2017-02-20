@@ -42,7 +42,7 @@ test_count = 0
 err_count = 0
 for a, b in product(tests, tests):
     test_count += 1
-    res = shell("./backup-chk %s %s" %(a, b))
+    res = shell("./backup-chk %s:%s" %(a, b))
     if a == b and res:
         print "ERROR: Output when both sides are identical: %s: %s" %(a, res)
         err_count += 1
