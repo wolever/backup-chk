@@ -1,14 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
+	"path/filepath"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"github.com/alexcesaro/log"
 	"github.com/alexcesaro/log/golog"
@@ -19,20 +26,23 @@ var ERR_NOT_DIR = errors.New("not a directory")
 
 var logger *golog.Logger
 
+var TOTAL_BYTES_READ uint64 = 0
+
 type WalkerItem struct {
-	root     *string
-	path     string
-	err      error
-	stat     *os.FileInfo
-	file     *os.File
-	_relpath *string
+	root        *string
+	path        string
+	err         error
+	stat        *os.FileInfo
+	file        *os.File
+	_relpath    *string
+	SkipReaddir bool
 }
 
-func WalkerItemFromFile(root *string, path string, stat os.FileInfo) *WalkerItem {
+func WalkerItemFromFile(root *string, path string, stat *os.FileInfo) *WalkerItem {
 	return &WalkerItem{
 		root: root,
 		path: path,
-		stat: &stat,
+		stat: stat,
 	}
 }
 
@@ -46,14 +56,18 @@ func WalkerItemFromRoot(root string) (*WalkerItem, error) {
 		return nil, ERR_NOT_DIR
 	}
 
-	return WalkerItemFromFile(&root, root, stat), nil
+	return WalkerItemFromFile(&root, root, &stat), nil
 }
 
 func (i *WalkerItem) makeStat() {
 	if i.stat == nil && i.err == nil {
 		stat, err := os.Lstat(i.path)
 		i.err = err
-		i.stat = &stat
+		if err == nil {
+			i.stat = &stat
+		} else {
+			i.stat = nil
+		}
 	}
 }
 
@@ -82,12 +96,15 @@ func (i *WalkerItem) GetItem(ref *WalkerItem) WalkerItem {
 
 func (i *WalkerItem) IsDir() bool {
 	i.makeStat()
-	return i.stat != nil && (*i.stat).IsDir()
+	if i.stat == nil {
+		return false
+	}
+	return (*i.stat).IsDir()
 }
 
-func (i *WalkerItem) Stat() (os.FileInfo, error) {
+func (i *WalkerItem) Stat() (*os.FileInfo, error) {
 	i.makeStat()
-	return *i.stat, i.err
+	return i.stat, i.err
 }
 
 func (i *WalkerItem) Readlink() (string, error) {
@@ -115,22 +132,102 @@ func (i *WalkerItem) Readdir(n int) ([]*WalkerItem, error) {
 	}
 	res := make([]*WalkerItem, len(files))
 	for idx, f := range files {
-		res[idx] = WalkerItemFromFile(i.root, path.Join(i.path, f.Name()), f)
+		fCopy := f
+		res[idx] = WalkerItemFromFile(i.root, path.Join(i.path, f.Name()), &fCopy)
 	}
 	return res, nil
 }
 
 type DFWalker struct {
-	root  *WalkerItem
-	stack []*WalkerItem
+	logfile      *os.File
+	logfileDirty *time.Time
+	logfilePos   int
+	root         *WalkerItem
+	stack        []*WalkerItem
+	closeLock    sync.Mutex
 }
 
-func NewDFWalker(root *WalkerItem) *DFWalker {
-	stack := make([]*WalkerItem, 1)
-	stack[0] = root
+func NewDFWalker(configDir string, root *WalkerItem) (*DFWalker, error) {
+	logfile, err := os.OpenFile(
+		path.Join(configDir, "walk-stack"),
+		os.O_APPEND|os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return nil, err
+	}
+
+	offset, err := logfile.Seek(0, os.SEEK_END)
+	if err != nil {
+		return nil, err
+	}
+
+	stack := []*WalkerItem{root}
+
+	if offset > 0 {
+		logger.Info("Loading previous run state from cache...")
+		_, err := logfile.Seek(0, os.SEEK_SET)
+		if err != nil {
+			return nil, err
+		}
+
+		scanner := bufio.NewScanner(logfile)
+		for scanner.Scan() {
+			line := strings.Trim(scanner.Text(), " \n")
+			if len(line) == 0 {
+				continue
+			}
+			item := WalkerItemFromFile(
+				&root.path,
+				path.Join(root.path, scanner.Text()),
+				nil)
+			item.SkipReaddir = true
+			stack = append(stack, item)
+		}
+	}
+
 	return &DFWalker{
-		root:  root,
-		stack: stack,
+		logfile: logfile,
+		root:    root,
+		stack:   stack,
+	}, nil
+}
+
+func (w *DFWalker) flush() {
+	logfile := w.logfile
+	if logfile == nil {
+		return
+	}
+
+	_, err := logfile.Seek(0, os.SEEK_SET)
+	if err != nil {
+		logger.Errorf("Error flushing log file (it should be removed): %s", err)
+		return
+	}
+
+	err = logfile.Truncate(0)
+	if err != nil {
+		logger.Errorf("Error truncating log file (it should be removed): %s", err)
+		return
+	}
+
+	if len(w.stack) == 0 {
+		return
+	}
+
+	logger.Info("Flushing walker stack to", logfile.Name())
+	for _, item := range w.stack {
+		logfile.Write([]byte(item.RelPath() + "\n"))
+	}
+}
+
+func (w *DFWalker) Close() {
+	if w.logfile != nil {
+		w.closeLock.Lock()
+		defer w.closeLock.Unlock()
+		if w.logfile != nil {
+			w.flush()
+			(*w.logfile).Close()
+			w.logfile = nil
+		}
 	}
 }
 
@@ -153,7 +250,7 @@ func (w *DFWalker) Next() (*WalkerItem, error) {
 		return nil, item.Err()
 	}
 
-	if item.IsDir() {
+	if item.IsDir() && !item.SkipReaddir {
 		for {
 			contents, err := item.Readdir(1000)
 			if err != nil && err != io.EOF {
@@ -171,20 +268,23 @@ func (w *DFWalker) Next() (*WalkerItem, error) {
 }
 
 func checkError(reference interface{}, backup interface{}, msg string) error {
-	return errors.New(fmt.Sprintf("%s: reference %s != backup %s",
+	return errors.New(fmt.Sprintf("%s: reference %v != backup %v",
 		msg, reference, backup))
 }
 
-func check(refItem *WalkerItem, bckItem WalkerItem) error {
-	bck, err := bckItem.Stat()
+func check(refItem *WalkerItem, bckItem *WalkerItem) error {
+	bckPtr, err := bckItem.Stat()
 	if err != nil {
 		return err
 	}
 
-	ref, err := refItem.Stat()
+	refPtr, err := refItem.Stat()
 	if err != nil {
 		return err
 	}
+
+	bck := *bckPtr
+	ref := *refPtr
 
 	if ref.ModTime().After(bck.ModTime()) {
 		return nil
@@ -227,7 +327,7 @@ func check(refItem *WalkerItem, bckItem WalkerItem) error {
 	}
 
 	if ref.Size() != bck.Size() {
-		return checkError(ref.Size(), bck.Size(), "size do not match")
+		return checkError(FormatInt(ref.Size()), FormatInt(bck.Size()), "size do not match")
 	}
 
 	rf, err := refItem.Open()
@@ -258,6 +358,8 @@ func check(refItem *WalkerItem, bckItem WalkerItem) error {
 			return err
 		}
 
+		TOTAL_BYTES_READ += uint64(rSz)
+
 		if bytes.Compare(rChunk, bChunk) != 0 {
 			return checkError(
 				fmt.Sprintf("(chunk of size %d)", rSz),
@@ -275,14 +377,61 @@ func check(refItem *WalkerItem, bckItem WalkerItem) error {
 }
 
 type CmdlineOptions struct {
-	Verbose []bool `short:"v" long:"verbose" description:"Show verbose debug information"`
+	Verbose   []bool `short:"v" long:"verbose" description:"Show verbose debug information"`
+	ConfigDir string `short:"c" long:"config-dir" default:"~/.backup-chk/" description:"Configuration and status directory"`
 }
 
 type TMGuess struct {
-	NoTM      bool
-	Unmounted bool
-	Invalid   bool
-	Directory *string
+	NoTM           bool
+	Unmounted      bool
+	Invalid        bool
+	Directory      *string
+	HomeVolumeName *string
+}
+
+func darwinGetRootDeviceName() (string, error) {
+	outBytes, err := exec.Command("diskutil", "info", "-plist", "/").CombinedOutput()
+	if err != nil {
+		return "", err
+	}
+
+	type Node struct {
+		XMLName xml.Name
+		Content string `xml:",chardata"`
+		Nodes   []Node `xml:",any"`
+	}
+
+	r := strings.NewReader(string(outBytes))
+	d := xml.NewDecoder(r)
+
+	n := Node{}
+	d.Decode(&n)
+
+	walk := func(node Node, prev Node) (string, error) { return "", nil }
+	walk = func(node Node, prev Node) (string, error) {
+		if prev.XMLName.Local == "key" && prev.Content == "VolumeName" {
+			if node.XMLName.Local != "string" {
+				return "", errors.New("error parsing plist (got unexpected node after VolumeName: " + node.XMLName.Local + ")")
+			}
+			return string(node.Content), nil
+		}
+		for _, child := range node.Nodes {
+			res, err := walk(child, prev)
+			if err != nil {
+				return "", err
+			}
+			if len(res) > 0 {
+				return res, nil
+			}
+			prev = child
+		}
+		return "", nil
+	}
+	res, err := walk(n, n)
+	if len(res) == 0 {
+		return "", errors.New("Could not find VolumeName in diskutil output")
+	}
+	return res, nil
 }
 
 func guessTimeMachineBackup() *TMGuess {
@@ -290,14 +439,14 @@ func guessTimeMachineBackup() *TMGuess {
 
 	out := strings.Trim(string(outBytes), " \n")
 	if !strings.HasPrefix(out, "/") {
-		logger.Debugf("tmutil unexpected output: %s (not guessing default directories)", out)
+		logger.Infof("tmutil unexpected output: %s (not guessing default directories)", out)
 		return &TMGuess{
 			Unmounted: true,
 		}
 	}
 
 	if err != nil {
-		logger.Debugf("tmutil returned error: %s (not guessing default directories)", err)
+		logger.Infof("tmutil returned error: %s (not guessing default directories)", err)
 		return &TMGuess{
 			NoTM: true,
 		}
@@ -305,28 +454,36 @@ func guessTimeMachineBackup() *TMGuess {
 
 	st, err := os.Stat(out)
 	if err != nil || !st.IsDir() {
-		logger.Debugf("tmutil did not return a directory: %s (not guessing default directories)", out)
+		logger.Infof("tmutil did not return a directory: %s (not guessing default directories)", out)
 		return &TMGuess{
 			Invalid: true,
 		}
 	}
+
+	// For now, assume /Users is a directory of / and not a mountpoint
+	homeVolName, err := darwinGetRootDeviceName()
+	if err != nil {
+		logger.Info("error looking up root device name:", err)
+		return &TMGuess{
+			Invalid: true,
+		}
+	}
+
 	return &TMGuess{
-		Directory: &out,
+		Directory:      &out,
+		HomeVolumeName: &homeVolName,
 	}
 }
 
-func min(a int, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func main() {
+func _main() int {
 	opts := CmdlineOptions{}
 	parser := flags.NewParser(&opts, flags.Default)
 	parser.Usage = "[-v] REFERENCE_DIR:BACKUP_DIR ..."
 	args, err := parser.Parse()
+
+	// Setup console
+	c := BackupChkConsoleInstallMonkeypatch()
+	defer c.Close()
 
 	var logLevels = []log.Level{
 		log.Warning,
@@ -340,7 +497,7 @@ func main() {
 	if args != nil && len(args) == 0 {
 		guess = guessTimeMachineBackup()
 		if (*guess).Directory != nil {
-			args = []string{"/Home/" + path.Join(*guess.Directory, "Home")}
+			args = []string{"/Users/:" + path.Join(*guess.Directory, *guess.HomeVolumeName, "Users")}
 		}
 	}
 
@@ -356,7 +513,7 @@ func main() {
 		fmt.Printf("  $ %s /Users/wolever:/Volumes/Backup/Users/wolever\n", argv0)
 		fmt.Printf("\n")
 		fmt.Printf("Defaults:\n")
-		fmt.Printf("  On OS X, REFERENCE_DIR defaults to /Home/ and BACKUP_DIR \n")
+		fmt.Printf("  On OS X, REFERENCE_DIR defaults to /Users/ and BACKUP_DIR \n")
 		fmt.Printf("  defaults to your most recent Time Machine backup.\n")
 		if guess != nil {
 			g := *guess
@@ -371,10 +528,10 @@ func main() {
 			}
 		}
 		fmt.Printf("\n")
-		os.Exit(1)
-		return
+		return 1
 	}
 
+	// Parse ref:bck pairs
 	type Pair struct {
 		ref *WalkerItem
 		bck *WalkerItem
@@ -384,51 +541,123 @@ func main() {
 	for idx, backup := range args {
 		pair := strings.Split(backup, ":")
 		if len(pair) != 2 {
-			logger.Errorf("invalid REFERENCE_DIR:BACKUP_DIR pair: %s (hint: /Home/:/Volumes/Backup/Home)", backup)
-			os.Exit(1)
+			logger.Errorf("invalid REFERENCE_DIR:BACKUP_DIR pair: %s (hint: /Users/:/Volumes/Backup/Users)", backup)
+			return 1
 		}
 
 		refRoot, err := WalkerItemFromRoot(pair[0])
 		if err != nil {
 			logger.Error(err)
-			os.Exit(1)
+			return 1
 		}
 
 		bckRoot, err := WalkerItemFromRoot(pair[1])
 		if err != nil {
 			logger.Error(err)
-			os.Exit(1)
+			return 1
 		}
 
 		pairs[idx] = Pair{refRoot, bckRoot}
 	}
 
+	// Initialize config directory
+	configDir, err := ExpandUser(opts.ConfigDir)
+	if err != nil {
+		logger.Error(err)
+		return 1
+	}
+	os.Mkdir(configDir, 0700)
+
+	// Setup signal handling
+	var walker *DFWalker
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		if walker != nil {
+			walker.Close()
+		}
+		c.Close()
+		os.Exit(1)
+	}()
+
+	startTime := time.Now()
+
 	for _, pair := range pairs {
+		logger.Infof("Checking: '%s' against '%s'", *pair.bck.root, *pair.ref.root)
 
-		walker := NewDFWalker(pair.ref)
+		refNorm, err := filepath.Abs(*pair.ref.root)
+		if err != nil {
+			logger.Error(err)
+			return 1
+		}
+		refNorm = filepath.Clean(refNorm)
+		refNorm = strings.Replace(refNorm, "-", "--", -1)
+		refNorm = strings.Replace(refNorm, "/", "-", -1)[1:]
+		runStatusDir := path.Join(configDir, "run-status", refNorm)
+		os.MkdirAll(runStatusDir, 0700)
 
+		walker, err = NewDFWalker(runStatusDir, pair.ref)
+		defer walker.Close()
+		if err != nil {
+			logger.Error(err)
+			return 1
+		}
+
+		count := 0
+		errCount := 0
+		lastTime := time.Time{}
 		for {
 			refItem, err := walker.Next()
 			if err != nil {
-				fmt.Println("ERROR:", err)
 				logger.Error(err)
-				return
+				return 1
 			}
 
 			if refItem == nil {
+				logger.Infof("Finished! Checked %s items with %s errors.", count, errCount)
 				break
 			}
 
 			if refItem.Err() != nil {
-				fmt.Println("ASSERITON ERROR: refItem.Err() should not be nil")
+				logger.Error("ASSERITON ERROR: refItem.Err() should not be nil")
 				logger.Error(refItem.Err())
-				return
+				return 1
 			}
 
-			err = check(refItem, pair.bck.GetItem(refItem))
+			bckItem := pair.bck.GetItem(refItem)
+			if logLevel >= log.Debug {
+				logger.Debug("Checking", bckItem.RelPath())
+			}
+
+			err = check(refItem, &bckItem)
 			if err != nil {
-				fmt.Printf("%s: %s\n", refItem.RelPath(), err)
+				logger.Warningf("%s: %s", refItem.RelPath(), err)
+				errCount += 1
+			}
+			count += 1
+
+			if logLevel >= log.Info && !bckItem.IsDir() {
+				now := time.Now()
+				if now.Sub(lastTime).Seconds() > 3 {
+					lastTime = now
+					rate := float64(TOTAL_BYTES_READ) / float64(now.Sub(startTime).Seconds()) / 1024.0 / 1024.0
+					c.Printf(
+						"\r\033[2K%s checked / %s errors @ %0.02fGB/s (%s)",
+						FormatInt(errCount),
+						FormatInt(count),
+						rate,
+						bckItem.RelPath())
+				}
 			}
 		}
+
+		walker.Close()
 	}
+
+	return 0
+}
+
+func main() {
+	os.Exit(_main())
 }

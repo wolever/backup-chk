@@ -1,1 +1,8 @@
 - Make sure we don't cross filesystem boundries
+- save currently processing file to cache
+- Add --timemachine option which:
+    - Sets up time machine
+    - Adds list of default ignored things:
+        - .Trash
+        - Library/Caches
+    - Uses the timestamp on the backup to ignore files created after that time
