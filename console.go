@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 )
 
 type BackupChkConsole struct {
@@ -17,6 +18,7 @@ type BackupChkConsole struct {
 	realStderr *os.File
 
 	needsNewline bool
+	finalize     sync.WaitGroup
 }
 
 func BackupChkConsoleInstallMonkeypatch() *BackupChkConsole {
@@ -46,6 +48,8 @@ func BackupChkConsoleInstallMonkeypatch() *BackupChkConsole {
 	os.Stdout = res.Stdout
 	os.Stderr = res.Stderr
 
+	res.finalize.Add(2)
+
 	go res.shuffleBytes(res.stdoutRead, res.realStdout)
 	go res.shuffleBytes(res.stderrRead, res.realStderr)
 
@@ -58,6 +62,7 @@ func (c *BackupChkConsole) Printf(format string, a ...interface{}) (int, error) 
 
 func (c *BackupChkConsole) shuffleBytes(src *os.File, dst *os.File) {
 	buf := make([]byte, 1024)
+	defer c.finalize.Done()
 	for {
 		count, err := src.Read(buf)
 		if err == io.EOF {
@@ -98,12 +103,14 @@ func (c *BackupChkConsole) Close() {
 	os.Stdout = c.realStdout
 	os.Stderr = c.realStderr
 
-	c.realStdout = nil
-	c.realStderr = nil
-
 	c.Stdout.Close()
 	c.Stderr.Close()
 
-	c.stdoutRead.Close()
-	c.stderrRead.Close()
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+
+	c.realStdout = nil
+	c.realStderr = nil
+
+	c.finalize.Wait()
 }

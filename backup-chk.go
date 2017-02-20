@@ -377,14 +377,17 @@ func check(refItem *WalkerItem, bckItem *WalkerItem) error {
 }
 
 type CmdlineOptions struct {
-	Verbose   []bool `short:"v" long:"verbose" description:"Show verbose debug information"`
-	ConfigDir string `short:"c" long:"config-dir" default:"~/.backup-chk/" description:"Configuration and status directory"`
+	Verbose     []bool `short:"v" long:"verbose" description:"Show verbose debug information"`
+	TimeMachine bool   `short:"t" long:"time-machine" description:"Use Time Machine defaults"`
+	ConfigDir   string `short:"c" long:"config-dir" default:"~/.backup-chk/" description:"Configuration and status directory"`
 }
 
 type TMGuess struct {
-	NoTM           bool
-	Unmounted      bool
-	Invalid        bool
+	NoTM      bool
+	Unmounted bool
+	Invalid   bool
+
+	Okay           bool
 	Directory      *string
 	HomeVolumeName *string
 }
@@ -470,15 +473,29 @@ func guessTimeMachineBackup() *TMGuess {
 	}
 
 	return &TMGuess{
+		Okay: true,
+
 		Directory:      &out,
 		HomeVolumeName: &homeVolName,
+	}
+}
+
+func showTimeMachineHelp(g *TMGuess, indent string) {
+	if g.NoTM {
+		fmt.Println(indent + "Time Machine (tmutil) was not found.")
+	} else if g.Unmounted {
+		fmt.Println(indent + "Time Machine backup isn't mounted.")
+	} else if g.Invalid {
+		fmt.Println(indent + "tmutil returned an invalid path (run with -v for more info).")
+	} else if g.Directory != nil {
+		fmt.Println(indent + "This Time Machine backup will be used: " + *g.Directory)
 	}
 }
 
 func _main() int {
 	opts := CmdlineOptions{}
 	parser := flags.NewParser(&opts, flags.Default)
-	parser.Usage = "[-v] REFERENCE_DIR:BACKUP_DIR ..."
+	parser.Usage = "[OPTIONS] [-vv] [--time-machine] [REFERENCE_DIR:BACKUP_DIR ...]"
 	args, err := parser.Parse()
 
 	// Setup console
@@ -493,39 +510,31 @@ func _main() int {
 	logLevel := logLevels[min(len(opts.Verbose), len(logLevels)-1)]
 	logger = golog.New(os.Stderr, logLevel)
 
-	guess := (*TMGuess)(nil)
-	if args != nil && len(args) == 0 {
-		guess = guessTimeMachineBackup()
-		if (*guess).Directory != nil {
-			args = []string{"/Users/:" + path.Join(*guess.Directory, *guess.HomeVolumeName, "Users")}
+	tmGuess := (*TMGuess)(nil)
+	if opts.TimeMachine {
+		tmGuess = guessTimeMachineBackup()
+		if (*tmGuess).Directory != nil {
+			args = []string{"/Users/:" + path.Join(*tmGuess.Directory, *tmGuess.HomeVolumeName, "Users")}
+		}
+		if !tmGuess.Okay {
+			showTimeMachineHelp(tmGuess, "Error: ")
+			return 1
 		}
 	}
 
-	if err != nil {
-		if args == nil {
-			fmt.Print(err)
-		}
-		fmt.Println("Example:")
+	if err != nil || args == nil || len(args) == 0 {
+		parser.WriteHelp(c.Stdout)
+
+		fmt.Println("\nExample:")
 		argv0 := os.Args[0]
 		if len(argv0) > 15 {
 			argv0 = "..." + argv0[len(argv0)-15:]
 		}
+		fmt.Printf("  $ %s --time-machine\n", argv0)
 		fmt.Printf("  $ %s /Users/wolever:/Volumes/Backup/Users/wolever\n", argv0)
-		fmt.Printf("\n")
-		fmt.Printf("Defaults:\n")
-		fmt.Printf("  On OS X, REFERENCE_DIR defaults to /Users/ and BACKUP_DIR \n")
-		fmt.Printf("  defaults to your most recent Time Machine backup.\n")
-		if guess != nil {
-			g := *guess
-			if g.NoTM {
-				fmt.Println("  Time Machine (tmutil) was not found so there will be no default.")
-			} else if g.Unmounted {
-				fmt.Println("  Your Time Machine backup isn't mounted and will not be used.")
-			} else if g.Invalid {
-				fmt.Println("  tmutil returned an invalid path (use -vvv for more).")
-			} else if g.Directory != nil {
-				fmt.Println("  This Time Machine backup will be used: " + *g.Directory)
-			}
+		if tmGuess != nil {
+			fmt.Printf("\nTime Machine:\n")
+			showTimeMachineHelp(tmGuess, "  ")
 		}
 		fmt.Printf("\n")
 		return 1
@@ -581,8 +590,8 @@ func _main() int {
 		os.Exit(1)
 	}()
 
+	// Actually check things!
 	startTime := time.Now()
-
 	for _, pair := range pairs {
 		logger.Infof("Checking: '%s' against '%s'", *pair.bck.root, *pair.ref.root)
 
