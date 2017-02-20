@@ -142,12 +142,17 @@ type DFWalker struct {
 	logfile      *os.File
 	logfileDirty *time.Time
 	logfilePos   int
-	root         *WalkerItem
-	stack        []*WalkerItem
-	closeLock    sync.Mutex
+
+	root    *WalkerItem
+	stack   []*WalkerItem
+	exclude pathMatchFn
+
+	closeLock sync.Mutex
 }
 
-func NewDFWalker(configDir string, root *WalkerItem) (*DFWalker, error) {
+type pathMatchFn *func(string) bool
+
+func NewDFWalker(configDir string, root *WalkerItem, exclude pathMatchFn) (*DFWalker, error) {
 	logfile, err := os.OpenFile(
 		path.Join(configDir, "walk-stack"),
 		os.O_APPEND|os.O_RDWR|os.O_CREATE, 0600)
@@ -256,7 +261,12 @@ func (w *DFWalker) Next() (*WalkerItem, error) {
 			if err != nil && err != io.EOF {
 				return nil, err
 			}
-			w.stack = append(w.stack, contents...)
+			for _, p := range contents {
+				if w.exclude != nil && (*w.exclude)(p.RelPath()) {
+					continue
+				}
+				w.stack = append(w.stack, p)
+			}
 
 			if len(contents) == 0 {
 				break
@@ -377,9 +387,10 @@ func check(refItem *WalkerItem, bckItem *WalkerItem) error {
 }
 
 type CmdlineOptions struct {
-	Verbose     []bool `short:"v" long:"verbose" description:"Show verbose debug information"`
-	TimeMachine bool   `short:"t" long:"time-machine" description:"Use Time Machine defaults"`
-	ConfigDir   string `short:"c" long:"config-dir" default:"~/.backup-chk/" description:"Configuration and status directory"`
+	Verbose     []bool   `short:"v" long:"verbose" description:"Show verbose debug information"`
+	TimeMachine bool     `short:"t" long:"time-machine" description:"Use Time Machine defaults"`
+	Exclude     []string `short:"x" long:"exclude" description:"Exclude files with relative paths matching this pattern. Matching is simple glob matching (ex, 'foo*bar' matches 'foo/x/bar', 'foobar', and 'foo-bar')"`
+	ConfigDir   string   `short:"c" long:"config-dir" default:"~/.backup-chk/" description:"Configuration and status directory"`
 }
 
 type TMGuess struct {
@@ -492,6 +503,41 @@ func showTimeMachineHelp(g *TMGuess, indent string) {
 	}
 }
 
+func buildExcludeFunc(rawPats []string) (pathMatchFn, error) {
+	if len(rawPats) == 0 {
+		return nil, nil
+	}
+
+	pats := make([][]string, len(rawPats))
+	for idx, pat := range rawPats {
+		pat = strings.Trim(pat, "*")
+		pats[idx] = strings.Split(pat, "*")
+	}
+
+	excludeFunc := func(p string) bool {
+		for patIdx, pat := range pats {
+			loc := 0
+			for _, patBit := range pat {
+				loc = strings.Index(p[loc:], patBit)
+				if loc < 0 {
+					break
+				}
+			}
+
+			if loc >= 0 {
+				if patIdx > 0 {
+					pats[patIdx-1], pats[patIdx] = pats[patIdx], pats[patIdx-1]
+				}
+				return true
+			}
+		}
+
+		return false
+	}
+
+	return &excludeFunc, nil
+}
+
 func _main() int {
 	opts := CmdlineOptions{}
 	parser := flags.NewParser(&opts, flags.Default)
@@ -502,14 +548,21 @@ func _main() int {
 	c := BackupChkConsoleInstallMonkeypatch()
 	defer c.Close()
 
+	// Setup logging
 	var logLevels = []log.Level{
 		log.Warning,
 		log.Info,
 		log.Debug,
 	}
 	logLevel := logLevels[min(len(opts.Verbose), len(logLevels)-1)]
-	logger = golog.New(os.Stderr, logLevel)
+	logger = golog.New(os.Stderr, log.Debug)
+	logger.Writer = func(out io.Writer, logLine []byte, level log.Level) {
+		if level <= logLevel {
+			out.Write(logLine)
+		}
+	}
 
+	// Check for TimeMachine
 	tmGuess := (*TMGuess)(nil)
 	if opts.TimeMachine {
 		tmGuess = guessTimeMachineBackup()
@@ -520,12 +573,23 @@ func _main() int {
 			showTimeMachineHelp(tmGuess, "Error: ")
 			return 1
 		}
+		opts.Exclude = append(
+			opts.Exclude,
+			"Library/Cache",
+			".Trash",
+		)
 	}
 
+	// Show help
 	if err != nil || args == nil || len(args) == 0 {
-		parser.WriteHelp(c.Stdout)
+		if err == nil {
+			parser.WriteHelp(c.Stdout)
+			fmt.Print("\n")
+		} else {
+			fmt.Println(err)
+		}
 
-		fmt.Println("\nExample:")
+		fmt.Println("Example:")
 		argv0 := os.Args[0]
 		if len(argv0) > 15 {
 			argv0 = "..." + argv0[len(argv0)-15:]
@@ -569,6 +633,13 @@ func _main() int {
 		pairs[idx] = Pair{refRoot, bckRoot}
 	}
 
+	// Setup exclude function
+	excludeFunc, err := buildExcludeFunc(opts.Exclude)
+	if err != nil {
+		logger.Error(err)
+		return 1
+	}
+
 	// Initialize config directory
 	configDir, err := ExpandUser(opts.ConfigDir)
 	if err != nil {
@@ -595,6 +666,7 @@ func _main() int {
 	for _, pair := range pairs {
 		logger.Infof("Checking: '%s' against '%s'", *pair.bck.root, *pair.ref.root)
 
+		// Setup status directory
 		refNorm, err := filepath.Abs(*pair.ref.root)
 		if err != nil {
 			logger.Error(err)
@@ -606,7 +678,40 @@ func _main() int {
 		runStatusDir := path.Join(configDir, "run-status", refNorm)
 		os.MkdirAll(runStatusDir, 0700)
 
-		walker, err = NewDFWalker(runStatusDir, pair.ref)
+		// Setup logging
+		sessionLogFileName := path.Join(runStatusDir, "log.txt")
+		sessionLogFile, err := os.OpenFile(
+			sessionLogFileName,
+			os.O_APPEND|os.O_WRONLY|os.O_CREATE,
+			0600)
+
+		origWriter := logger.Writer
+		logCleanup := func() {
+			if sessionLogFile == nil {
+				return
+			}
+			logger.Writer = origWriter
+			sessionLogFile.Close()
+			sessionLogFile = nil
+		}
+		defer logCleanup()
+
+		if err != nil {
+			logger.Errorf("Error opening session log file: %s", err)
+		} else {
+			sessionLogFile.Write([]byte("Starting session...\n"))
+			logger.Writer = func(out io.Writer, logLine []byte, level log.Level) {
+				if level <= logLevel {
+					out.Write(logLine)
+				}
+				if sessionLogFile != nil && level < log.Debug {
+					sessionLogFile.Write(logLine)
+				}
+			}
+		}
+
+		// Setup walker
+		walker, err = NewDFWalker(runStatusDir, pair.ref, excludeFunc)
 		defer walker.Close()
 		if err != nil {
 			logger.Error(err)
@@ -624,7 +729,6 @@ func _main() int {
 			}
 
 			if refItem == nil {
-				logger.Infof("Finished! Checked %s items with %s errors.", count, errCount)
 				break
 			}
 
@@ -650,7 +754,7 @@ func _main() int {
 				now := time.Now()
 				if now.Sub(lastTime).Seconds() > 3 {
 					lastTime = now
-					rate := float64(TOTAL_BYTES_READ) / float64(now.Sub(startTime).Seconds()) / 1024.0 / 1024.0
+					rate := float64(TOTAL_BYTES_READ) / now.Sub(startTime).Seconds() / 1024.0 / 1024.0
 					c.Printf(
 						"\r\033[2K%s checked / %s errors @ %0.02fGB/s (%s)",
 						FormatInt(errCount),
@@ -661,7 +765,26 @@ func _main() int {
 			}
 		}
 
+		now := time.Now()
+		duration := now.Sub(startTime)
+		rate := float64(TOTAL_BYTES_READ) / duration.Seconds() / 1024.0 / 1024.0
+		logger.Infof(
+			"Finished! %s checked, %s errors, and %s bytes in %v (%0.0f files/s, %0.02fGB/s)",
+			FormatInt(count),
+			FormatInt(errCount),
+			FormatInt(int64(TOTAL_BYTES_READ)),
+			duration,
+			float64(count)/duration.Seconds(),
+			rate,
+		)
+
 		walker.Close()
+		if errCount > 0 && sessionLogFile != nil {
+			logCleanup()
+			logger.Warning("Errors logged to:", sessionLogFileName)
+		} else {
+			logCleanup()
+		}
 	}
 
 	return 0
